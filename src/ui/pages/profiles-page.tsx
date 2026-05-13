@@ -45,6 +45,7 @@ export const ProfilesPage = ({
   const [providersSnapshot, setProvidersSnapshot] =
     useState<CcSwitchProvidersSnapshot | null>(null)
   const [providersLoading, setProvidersLoading] = useState(false)
+  const [checkingProcess, setCheckingProcess] = useState(false)
   const [injecting, setInjecting] = useState(false)
   const [injectError, setInjectError] = useState<string | null>(null)
   const [lastInject, setLastInject] = useState<InjectStatusLineResult | null>(null)
@@ -87,14 +88,26 @@ export const ProfilesPage = ({
   const handleFixAll = async () => {
     setInjectError(null)
     setLastInject(null)
-    setInjecting(true)
+
     try {
-      if (await isCcSwitchProcessRunning()) {
+      setCheckingProcess(true)
+      const running = await isCcSwitchProcessRunning()
+      if (running) {
         setInjectError(
           'cc-switch is currently running. Please exit it from the system tray (right-click → Quit) and try again.',
         )
         return
       }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      setInjectError(message)
+      return
+    } finally {
+      setCheckingProcess(false)
+    }
+
+    setInjecting(true)
+    try {
       const result = await injectStatusLineToAllProviders(
         ccSwitchConfigDir,
         'claude',
@@ -111,6 +124,7 @@ export const ProfilesPage = ({
   }
 
   const providers = providersSnapshot?.providers ?? []
+  const fixBusy = checkingProcess || injecting
   const missingStatusLineCount = providers.filter(
     (provider) => !provider.hasStatusLine,
   ).length
@@ -144,7 +158,7 @@ export const ProfilesPage = ({
       <section className="panel">
         <header className="panel-header">
           <h2>cc-switch SQLite Providers (claude)</h2>
-          <button type="button" onClick={reloadProviders} disabled={providersLoading || injecting}>
+          <button type="button" onClick={reloadProviders} disabled={providersLoading || fixBusy}>
             {providersLoading ? 'Refreshing…' : 'Refresh'}
           </button>
         </header>
@@ -174,10 +188,14 @@ export const ProfilesPage = ({
                 <button
                   type="button"
                   onClick={handleFixAll}
-                  disabled={injecting}
+                  disabled={fixBusy}
                   style={{ marginLeft: 'auto' }}
                 >
-                  {injecting ? 'Injecting…' : `Fix all (inject statusLine into ${providers.length})`}
+                  {checkingProcess
+                    ? 'Checking cc-switch…'
+                    : injecting
+                      ? 'Injecting…'
+                      : `Fix all (inject statusLine into ${providers.length})`}
                 </button>
               </div>
             )}

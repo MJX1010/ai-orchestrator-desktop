@@ -4,7 +4,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+  CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 
 #[derive(Serialize)]
 struct SuperpowerSkill {
@@ -209,19 +215,39 @@ fn is_supported_cc_switch_app_type(app_type: &str) -> bool {
 fn is_cc_switch_process_running() -> bool {
   #[cfg(target_os = "windows")]
   {
-    let candidates = ["CC-Switch.exe", "cc-switch.exe"];
-    for candidate in candidates {
-      let output = Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {candidate}"), "/NH"])
-        .output();
-      if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.to_lowercase().contains(&candidate.to_lowercase()) {
-          return true;
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+      return false;
+    }
+
+    let mut entry = PROCESSENTRY32W {
+      dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+      ..unsafe { std::mem::zeroed() }
+    };
+
+    let mut found = false;
+    let first_ok = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    if first_ok {
+      loop {
+        let exe_name_len = entry
+          .szExeFile
+          .iter()
+          .position(|&ch| ch == 0)
+          .unwrap_or(entry.szExeFile.len());
+        let exe_name = String::from_utf16_lossy(&entry.szExeFile[..exe_name_len]).to_lowercase();
+        if exe_name == "cc-switch.exe" {
+          found = true;
+          break;
+        }
+
+        if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+          break;
         }
       }
     }
-    false
+
+    let _ = unsafe { CloseHandle(snapshot) };
+    found
   }
   #[cfg(not(target_os = "windows"))]
   {
@@ -268,31 +294,29 @@ fn run_git(repo_dir: &PathBuf, args: &[&str]) -> Result<String, String> {
   Ok(stdout)
 }
 
-fn run_sqlite_json<T>(db_path: &PathBuf, query: &str) -> Result<Vec<T>, String>
-where
-  T: for<'de> Deserialize<'de>,
-{
-  let output = Command::new("sqlite3")
-    .arg("-readonly")
-    .arg("-json")
-    .arg(db_path)
-    .arg(query)
-    .output()
-    .map_err(|err| format!("Failed to run sqlite3: {err}"))?;
+fn open_ccswitch_readonly_connection(db_path: &PathBuf) -> Result<rusqlite::Connection, String> {
+  let conn = rusqlite::Connection::open_with_flags(
+    db_path,
+    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+  )
+  .map_err(|err| format!("Failed to open cc-switch DB read-only: {err}"))?;
 
-  let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-  let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+  conn
+    .busy_timeout(Duration::from_millis(500))
+    .map_err(|err| format!("Failed to configure cc-switch DB timeout: {err}"))?;
 
-  if !output.status.success() {
-    return Err(if stderr.is_empty() {
-      stdout
-    } else {
-      stderr
-    });
-  }
+  Ok(conn)
+}
 
-  serde_json::from_str::<Vec<T>>(&stdout)
-    .map_err(|err| format!("Failed to parse sqlite3 JSON output: {err}"))
+fn open_ccswitch_write_connection(db_path: &PathBuf) -> Result<rusqlite::Connection, String> {
+  let conn = rusqlite::Connection::open(db_path)
+    .map_err(|err| format!("Failed to open cc-switch DB: {err}"))?;
+
+  conn
+    .busy_timeout(Duration::from_millis(1000))
+    .map_err(|err| format!("Failed to configure cc-switch DB timeout: {err}"))?;
+
+  Ok(conn)
 }
 
 fn parse_git_local_changes(status_output: &str) -> Vec<GitChangePreview> {
@@ -831,6 +855,13 @@ fn ccswitch_read_lifecycle(
     ));
   }
 
+  let conn = match open_ccswitch_readonly_connection(&db_path) {
+    Ok(conn) => conn,
+    Err(error) => {
+      return Ok(unavailable_sqlite_snapshot(&db_path, error));
+    }
+  };
+
   let stats_query = "
     select
       (select count(*) from skills) as skillsCount,
@@ -839,10 +870,20 @@ fn ccswitch_read_lifecycle(
       (select max(updated_at) from skills) as latestSkillUpdatedAt
   ";
 
-  let stats = match run_sqlite_json::<CcSwitchSqliteStatsRow>(&db_path, stats_query) {
-    Ok(rows) => rows.into_iter().next(),
+  let stats = match conn.query_row(stats_query, [], |row| {
+    Ok(CcSwitchSqliteStatsRow {
+      skills_count: row.get(0)?,
+      enabled_claude_count: row.get(1)?,
+      enabled_codex_count: row.get(2)?,
+      latest_skill_updated_at: row.get(3)?,
+    })
+  }) {
+    Ok(stats) => stats,
     Err(error) => {
-      return Ok(unavailable_sqlite_snapshot(&db_path, error));
+      return Ok(unavailable_sqlite_snapshot(
+        &db_path,
+        format!("Failed to query cc-switch skill stats: {error}"),
+      ));
     }
   };
 
@@ -860,7 +901,37 @@ fn ccswitch_read_lifecycle(
     limit 8
   ";
 
-  let sample_skills = match run_sqlite_json::<CcSwitchSqliteSkillRow>(&db_path, sample_query) {
+  let mut sample_stmt = match conn.prepare(sample_query) {
+    Ok(stmt) => stmt,
+    Err(error) => {
+      return Ok(unavailable_sqlite_snapshot(
+        &db_path,
+        format!("Failed to prepare cc-switch sample query: {error}"),
+      ));
+    }
+  };
+
+  let sample_rows = match sample_stmt.query_map([], |row| {
+    Ok(CcSwitchSqliteSkillRow {
+      id: row.get(0)?,
+      name: row.get(1)?,
+      directory: row.get(2)?,
+      enabled_claude: row.get(3)?,
+      enabled_codex: row.get(4)?,
+      installed_at: row.get(5)?,
+      updated_at: row.get(6)?,
+    })
+  }) {
+    Ok(rows) => rows,
+    Err(error) => {
+      return Ok(unavailable_sqlite_snapshot(
+        &db_path,
+        format!("Failed to query cc-switch sample rows: {error}"),
+      ));
+    }
+  };
+
+  let sample_skills = match sample_rows.collect::<Result<Vec<_>, _>>() {
     Ok(rows) => rows
       .into_iter()
       .map(|row| CcSwitchSqliteSkill {
@@ -874,16 +945,12 @@ fn ccswitch_read_lifecycle(
       })
       .collect(),
     Err(error) => {
-      return Ok(unavailable_sqlite_snapshot(&db_path, error));
+      return Ok(unavailable_sqlite_snapshot(
+        &db_path,
+        format!("Failed to collect cc-switch sample rows: {error}"),
+      ));
     }
   };
-
-  let stats = stats.unwrap_or(CcSwitchSqliteStatsRow {
-    skills_count: 0,
-    enabled_claude_count: 0,
-    enabled_codex_count: 0,
-    latest_skill_updated_at: None,
-  });
 
   Ok(CcSwitchSqliteSnapshot {
     available: true,
@@ -926,27 +993,68 @@ fn ccswitch_list_providers(
     ));
   }
 
-  let query = format!(
-    "select \
-       id, \
-       app_type as appType, \
-       name, \
-       case when is_current != 0 then 1 else 0 end as isCurrent, \
-       case when json_extract(settings_config, '$.statusLine') is null then 0 else 1 end as hasStatusLine, \
-       coalesce(json_extract(settings_config, '$.statusLine.command'), '') as statusLineCommand \
-     from providers \
-     where app_type = '{}' \
-     order by name",
-    requested_app_type
-  );
-
-  let rows = match run_sqlite_json::<CcSwitchProviderRow>(&db_path, &query) {
-    Ok(rows) => rows,
+  let conn = match open_ccswitch_readonly_connection(&db_path) {
+    Ok(conn) => conn,
     Err(error) => {
       return Ok(unavailable_providers_snapshot(
         &db_path,
         &requested_app_type,
         error,
+      ));
+    }
+  };
+
+  let query = "
+    select
+      id,
+      app_type as appType,
+      name,
+      case when is_current != 0 then 1 else 0 end as isCurrent,
+      case when json_extract(settings_config, '$.statusLine') is null then 0 else 1 end as hasStatusLine,
+      coalesce(json_extract(settings_config, '$.statusLine.command'), '') as statusLineCommand
+    from providers
+    where app_type = ?1
+    order by name
+  ";
+
+  let mut stmt = match conn.prepare(query) {
+    Ok(stmt) => stmt,
+    Err(error) => {
+      return Ok(unavailable_providers_snapshot(
+        &db_path,
+        &requested_app_type,
+        format!("Failed to prepare cc-switch providers query: {error}"),
+      ));
+    }
+  };
+
+  let mapped_rows = match stmt.query_map([requested_app_type.as_str()], |row| {
+    Ok(CcSwitchProviderRow {
+      id: row.get(0)?,
+      app_type: row.get(1)?,
+      name: row.get(2)?,
+      is_current: row.get(3)?,
+      has_status_line: row.get(4)?,
+      status_line_command: row.get(5)?,
+    })
+  }) {
+    Ok(rows) => rows,
+    Err(error) => {
+      return Ok(unavailable_providers_snapshot(
+        &db_path,
+        &requested_app_type,
+        format!("Failed to query cc-switch providers: {error}"),
+      ));
+    }
+  };
+
+  let rows = match mapped_rows.collect::<Result<Vec<_>, _>>() {
+    Ok(rows) => rows,
+    Err(error) => {
+      return Ok(unavailable_providers_snapshot(
+        &db_path,
+        &requested_app_type,
+        format!("Failed to collect cc-switch providers: {error}"),
       ));
     }
   };
@@ -1013,8 +1121,7 @@ fn ccswitch_inject_status_line(
 
   let backup_path = backup_ccswitch_database(&ccswitch_config_dir)?;
 
-  let mut conn = rusqlite::Connection::open(&db_path)
-    .map_err(|err| format!("Failed to open cc-switch DB: {err}"))?;
+  let mut conn = open_ccswitch_write_connection(&db_path)?;
 
   let tx = conn
     .transaction()
