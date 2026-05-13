@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize)]
 struct SuperpowerSkill {
@@ -100,6 +101,47 @@ struct CcSwitchSqliteStatsRow {
   latest_skill_updated_at: Option<i64>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchProvider {
+  id: String,
+  app_type: String,
+  name: String,
+  is_current: bool,
+  has_status_line: bool,
+  status_line_command: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchProviderRow {
+  id: String,
+  app_type: String,
+  name: String,
+  is_current: i64,
+  has_status_line: i64,
+  status_line_command: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchProvidersSnapshot {
+  available: bool,
+  db_path: String,
+  app_type: String,
+  providers: Vec<CcSwitchProvider>,
+  error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectStatusLineResult {
+  updated_count: u32,
+  updated_provider_ids: Vec<String>,
+  backup_path: String,
+  status_line_command: Option<String>,
+}
+
 fn resolve_claude_settings_path(config_dir: &str) -> PathBuf {
   PathBuf::from(config_dir).join("settings.json")
 }
@@ -144,6 +186,65 @@ fn unavailable_sqlite_snapshot(db_path: &PathBuf, error: String) -> CcSwitchSqli
     sample_skills: Vec::new(),
     error: Some(error),
   }
+}
+
+fn unavailable_providers_snapshot(
+  db_path: &PathBuf,
+  app_type: &str,
+  error: String,
+) -> CcSwitchProvidersSnapshot {
+  CcSwitchProvidersSnapshot {
+    available: false,
+    db_path: db_path.display().to_string(),
+    app_type: app_type.to_string(),
+    providers: Vec::new(),
+    error: Some(error),
+  }
+}
+
+fn is_supported_cc_switch_app_type(app_type: &str) -> bool {
+  matches!(app_type, "claude" | "codex" | "gemini" | "opencode" | "hermes")
+}
+
+fn is_cc_switch_process_running() -> bool {
+  #[cfg(target_os = "windows")]
+  {
+    let candidates = ["CC-Switch.exe", "cc-switch.exe"];
+    for candidate in candidates {
+      let output = Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {candidate}"), "/NH"])
+        .output();
+      if let Ok(output) = output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.to_lowercase().contains(&candidate.to_lowercase()) {
+          return true;
+        }
+      }
+    }
+    false
+  }
+  #[cfg(not(target_os = "windows"))]
+  {
+    false
+  }
+}
+
+fn backup_ccswitch_database(ccswitch_config_dir: &str) -> Result<PathBuf, String> {
+  let db_path = resolve_ccswitch_database_path(ccswitch_config_dir);
+  if !db_path.exists() {
+    return Err(format!(
+      "cc-switch database file does not exist: {}",
+      db_path.display()
+    ));
+  }
+  let timestamp = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_secs())
+    .unwrap_or(0);
+  let backup_path = db_path.with_file_name(format!("cc-switch.db.bak-{timestamp}"));
+  fs::copy(&db_path, &backup_path)
+    .map_err(|err| format!("Failed to back up DB to {}: {err}", backup_path.display()))?;
+  Ok(backup_path)
 }
 
 fn run_git(repo_dir: &PathBuf, args: &[&str]) -> Result<String, String> {
@@ -797,6 +898,180 @@ fn ccswitch_read_lifecycle(
 }
 
 #[tauri::command]
+fn ccswitch_list_providers(
+  ccswitch_config_dir: String,
+  app_type_filter: Option<String>,
+) -> Result<CcSwitchProvidersSnapshot, String> {
+  let db_path = resolve_ccswitch_database_path(&ccswitch_config_dir);
+  let requested_app_type = app_type_filter
+    .as_deref()
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .unwrap_or("claude")
+    .to_string();
+
+  if !db_path.exists() {
+    return Ok(unavailable_providers_snapshot(
+      &db_path,
+      &requested_app_type,
+      "cc-switch database file does not exist".to_string(),
+    ));
+  }
+
+  if !is_supported_cc_switch_app_type(&requested_app_type) {
+    return Ok(unavailable_providers_snapshot(
+      &db_path,
+      &requested_app_type,
+      format!("Unsupported app_type: {requested_app_type}"),
+    ));
+  }
+
+  let query = format!(
+    "select \
+       id, \
+       app_type as appType, \
+       name, \
+       case when is_current != 0 then 1 else 0 end as isCurrent, \
+       case when json_extract(settings_config, '$.statusLine') is null then 0 else 1 end as hasStatusLine, \
+       coalesce(json_extract(settings_config, '$.statusLine.command'), '') as statusLineCommand \
+     from providers \
+     where app_type = '{}' \
+     order by name",
+    requested_app_type
+  );
+
+  let rows = match run_sqlite_json::<CcSwitchProviderRow>(&db_path, &query) {
+    Ok(rows) => rows,
+    Err(error) => {
+      return Ok(unavailable_providers_snapshot(
+        &db_path,
+        &requested_app_type,
+        error,
+      ));
+    }
+  };
+
+  let providers = rows
+    .into_iter()
+    .map(|row| CcSwitchProvider {
+      id: row.id,
+      app_type: row.app_type,
+      name: row.name,
+      is_current: row.is_current != 0,
+      has_status_line: row.has_status_line != 0,
+      status_line_command: row.status_line_command,
+    })
+    .collect();
+
+  Ok(CcSwitchProvidersSnapshot {
+    available: true,
+    db_path: db_path.display().to_string(),
+    app_type: requested_app_type,
+    providers,
+    error: None,
+  })
+}
+
+#[tauri::command]
+fn ccswitch_process_running() -> bool {
+  is_cc_switch_process_running()
+}
+
+#[tauri::command]
+fn ccswitch_backup_database(ccswitch_config_dir: String) -> Result<String, String> {
+  backup_ccswitch_database(&ccswitch_config_dir).map(|path| path.display().to_string())
+}
+
+#[tauri::command]
+fn ccswitch_inject_status_line(
+  ccswitch_config_dir: String,
+  app_type: String,
+  status_line: Value,
+) -> Result<InjectStatusLineResult, String> {
+  if is_cc_switch_process_running() {
+    return Err(
+      "cc-switch is running. Please exit it from the tray (right-click → Quit) before injecting."
+        .to_string(),
+    );
+  }
+
+  if !is_supported_cc_switch_app_type(&app_type) {
+    return Err(format!("Unsupported app_type: {app_type}"));
+  }
+
+  if !status_line.is_object() {
+    return Err("statusLine payload must be a JSON object".to_string());
+  }
+
+  let db_path = resolve_ccswitch_database_path(&ccswitch_config_dir);
+  if !db_path.exists() {
+    return Err(format!(
+      "cc-switch database not found: {}",
+      db_path.display()
+    ));
+  }
+
+  let backup_path = backup_ccswitch_database(&ccswitch_config_dir)?;
+
+  let mut conn = rusqlite::Connection::open(&db_path)
+    .map_err(|err| format!("Failed to open cc-switch DB: {err}"))?;
+
+  let tx = conn
+    .transaction()
+    .map_err(|err| format!("Failed to start transaction: {err}"))?;
+
+  let mut stmt = tx
+    .prepare("SELECT id, settings_config FROM providers WHERE app_type = ?1")
+    .map_err(|err| format!("Failed to prepare select: {err}"))?;
+  let mapped_rows = stmt
+    .query_map([&app_type], |row| {
+      Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .map_err(|err| format!("Failed to query providers: {err}"))?;
+  let rows: Vec<(String, String)> = mapped_rows
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| format!("Failed to collect provider rows: {err}"))?;
+  drop(stmt);
+
+  let mut updated_ids: Vec<String> = Vec::with_capacity(rows.len());
+  for (id, settings_config) in rows {
+    let mut cfg: Value = serde_json::from_str(&settings_config)
+      .map_err(|err| format!("Provider {id} has invalid settings_config JSON: {err}"))?;
+
+    let obj = cfg.as_object_mut().ok_or_else(|| {
+      format!("Provider {id} settings_config root must be a JSON object")
+    })?;
+    obj.insert("statusLine".to_string(), status_line.clone());
+
+    let new_config = serde_json::to_string(&cfg)
+      .map_err(|err| format!("Failed to serialize updated config for {id}: {err}"))?;
+
+    tx.execute(
+      "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = ?3",
+      rusqlite::params![new_config, id, app_type],
+    )
+    .map_err(|err| format!("Failed to update provider {id}: {err}"))?;
+
+    updated_ids.push(id);
+  }
+
+  tx.commit()
+    .map_err(|err| format!("Failed to commit transaction: {err}"))?;
+
+  let status_line_command = status_line
+    .get("command")
+    .and_then(|value| value.as_str())
+    .map(String::from);
+
+  Ok(InjectStatusLineResult {
+    updated_count: updated_ids.len() as u32,
+    updated_provider_ids: updated_ids,
+    backup_path: backup_path.display().to_string(),
+    status_line_command,
+  })
+}
+
+#[tauri::command]
 fn ccswitch_set_enabled(
   ccswitch_config_dir: String,
   enabled: bool,
@@ -897,6 +1172,10 @@ pub fn run() {
       git_write_desired_state,
       ccswitch_read_runtime,
       ccswitch_read_lifecycle,
+      ccswitch_list_providers,
+      ccswitch_process_running,
+      ccswitch_backup_database,
+      ccswitch_inject_status_line,
       ccswitch_set_enabled,
       ccswitch_set_ai_orchestrator_config,
       path_exists

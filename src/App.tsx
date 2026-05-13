@@ -118,6 +118,7 @@ function App() {
             plan={snapshot.lastPlan}
             lastReconciledAt={snapshot.observedState.lastReconciledAt}
             isBusy={isBusy}
+            ccSwitchConfigDir={snapshot.settings.paths.ccSwitchConfigDir}
             onDryRun={reconcileDryRun}
             onApply={reconcileApply}
           />

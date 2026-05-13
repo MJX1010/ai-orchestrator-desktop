@@ -189,6 +189,30 @@ export interface CcSwitchSqliteSnapshot {
   error?: string
 }
 
+export interface CcSwitchProvider {
+  id: string
+  appType: string
+  name: string
+  isCurrent: boolean
+  hasStatusLine: boolean
+  statusLineCommand: string
+}
+
+export interface CcSwitchProvidersSnapshot {
+  available: boolean
+  dbPath: string
+  appType: string
+  providers: CcSwitchProvider[]
+  error?: string
+}
+
+export interface InjectStatusLineResult {
+  updatedCount: number
+  updatedProviderIds: string[]
+  backupPath: string
+  statusLineCommand?: string
+}
+
 export interface AppSnapshot {
   manifests: PluginManifest[]
   profiles: string[]
