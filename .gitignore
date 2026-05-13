@@ -18,6 +18,10 @@ dist
 dist-ssr
 src-tauri/target
 .superpowers
+.memsearch/
+.omc/
+.dbg/
+src-tauri/target-*/
 *.local
 
 # Editor directories and files
