@@ -674,6 +674,301 @@ fn codex_set_superpowers_enabled(
   }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexInstalledPlugin {
+  plugin_id: String,
+  display_name: String,
+  marketplace: String,
+  version: String,
+  enabled: bool,
+}
+
+fn codex_config_path() -> Result<PathBuf, String> {
+  let profile = std::env::var("USERPROFILE")
+    .map_err(|_| "USERPROFILE environment variable not set".to_string())?;
+  Ok(PathBuf::from(profile).join(".codex").join("config.toml"))
+}
+
+fn parse_codex_config_plugins(config_path: &PathBuf) -> Result<Vec<CodexInstalledPlugin>, String> {
+  if !config_path.exists() {
+    return Ok(Vec::new());
+  }
+  let content = fs::read_to_string(config_path)
+    .map_err(|err| format!("Failed to read codex config: {err}"))?;
+  let doc: toml::Value = toml::from_str(&content)
+    .map_err(|err| format!("Failed to parse codex config.toml: {err}"))?;
+
+  let mut plugins: Vec<CodexInstalledPlugin> = Vec::new();
+
+  // Parse [plugins."<name>@<marketplace>"] sections
+  if let Some(table) = doc.get("plugins").and_then(|v| v.as_table()) {
+    for (key, value) in table {
+      // key is like "agentmemory@agentmemory"
+      let parts: Vec<&str> = key.splitn(2, '@').collect();
+      let plugin_id = parts.first().unwrap_or(&key.as_str()).to_string();
+      let marketplace = parts.get(1).unwrap_or(&"unknown").to_string();
+      let enabled = value
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+      // Try to find installed version from cache
+      let version = find_cached_plugin_version(&plugin_id, &marketplace);
+
+      let display_name = plugin_id
+        .split(&['-', '_'][..])
+        .map(|part| {
+          let mut chars = part.chars();
+          match chars.next() {
+            Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+            None => String::new(),
+          }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+      plugins.push(CodexInstalledPlugin {
+        plugin_id,
+        display_name,
+        marketplace,
+        version,
+        enabled,
+      });
+    }
+  }
+
+  // Parse [mcp_servers.<name>] sections — treat as plugins too
+  if let Some(table) = doc.get("mcp_servers").and_then(|v| v.as_table()) {
+    let plugin_ids: HashSet<String> = plugins.iter().map(|p| p.plugin_id.clone()).collect();
+    for (name, _value) in table {
+      // Skip if already registered as a plugin
+      if plugin_ids.contains(name.as_str()) {
+        continue;
+      }
+      let display_name = name
+        .split(&['-', '_'][..])
+        .map(|part| {
+          let mut chars = part.chars();
+          match chars.next() {
+            Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+            None => String::new(),
+          }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+      // Scan all cache marketplaces for this plugin
+      let version = find_cached_version_any_marketplace(name);
+      plugins.push(CodexInstalledPlugin {
+        plugin_id: name.clone(),
+        display_name,
+        marketplace: "mcp".to_string(),
+        version,
+        enabled: true,
+      });
+    }
+  }
+
+  Ok(plugins)
+}
+
+fn find_cached_plugin_version(plugin_id: &str, marketplace: &str) -> String {
+  let profile = match std::env::var("USERPROFILE") {
+    Ok(p) => p,
+    Err(_) => return "unknown".to_string(),
+  };
+  let plugin_dir = PathBuf::from(&profile)
+    .join(".codex")
+    .join("plugins")
+    .join("cache")
+    .join(marketplace)
+    .join(plugin_id);
+
+  if !plugin_dir.exists() {
+    return "unknown".to_string();
+  }
+
+  // Find the latest version directory (highest semver or most recent)
+  let mut versions: Vec<String> = Vec::new();
+  if let Ok(entries) = fs::read_dir(&plugin_dir) {
+    for entry in entries.flatten() {
+      let name = entry.file_name().to_string_lossy().to_string();
+      if entry.path().is_dir() && !name.starts_with('.') && name != "latest" {
+        versions.push(name);
+      }
+    }
+  }
+
+  versions.sort();
+  versions.last().cloned().unwrap_or_else(|| "unknown".to_string())
+}
+
+fn find_cached_version_any_marketplace(plugin_id: &str) -> String {
+  let profile = match std::env::var("USERPROFILE") {
+    Ok(p) => p,
+    Err(_) => return "unknown".to_string(),
+  };
+  let cache_root = PathBuf::from(&profile)
+    .join(".codex")
+    .join("plugins")
+    .join("cache");
+
+  if !cache_root.exists() {
+    return "unknown".to_string();
+  }
+
+  // Scan all marketplace directories for this plugin
+  if let Ok(marketplaces) = fs::read_dir(&cache_root) {
+    for marketplace_entry in marketplaces.flatten() {
+      if !marketplace_entry.path().is_dir() {
+        continue;
+      }
+      let mname = marketplace_entry.file_name().to_string_lossy().to_string();
+      if mname.starts_with('.') || mname.contains("backup") {
+        continue;
+      }
+      let plugin_dir = marketplace_entry.path().join(plugin_id);
+      if plugin_dir.exists() {
+        let mut versions: Vec<String> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&plugin_dir) {
+          for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.path().is_dir() && !name.starts_with('.') && name != "latest" {
+              versions.push(name);
+            }
+          }
+        }
+        versions.sort();
+        if let Some(v) = versions.last() {
+          return v.clone();
+        }
+      }
+    }
+  }
+
+  "unknown".to_string()
+}
+
+#[tauri::command]
+fn codex_read_installed_plugins() -> Result<Vec<CodexInstalledPlugin>, String> {
+  let mut plugins: Vec<CodexInstalledPlugin> = Vec::new();
+
+  // Always check if superpowers is installed (it's managed separately)
+  let source_root = superpowers_source_root()?;
+  if source_root.exists() {
+    let version = find_cached_plugin_version("superpowers", "claude-plugins-official");
+    plugins.push(CodexInstalledPlugin {
+      plugin_id: "superpowers".to_string(),
+      display_name: "Codex Superpowers".to_string(),
+      marketplace: "claude-plugins-official".to_string(),
+      version,
+      enabled: true,
+    });
+  }
+
+  // Parse config.toml for other installed plugins
+  let config_path = codex_config_path()?;
+  if let Ok(config_plugins) = parse_codex_config_plugins(&config_path) {
+    for plugin in config_plugins {
+      // Skip superpowers since we already added it
+      if plugin.plugin_id == "superpowers" {
+        continue;
+      }
+      plugins.push(plugin);
+    }
+  }
+
+  plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+  Ok(plugins)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HermesMcpServer {
+  name: String,
+  command: String,
+  args: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HermesRuntimeState {
+  mcp_servers: Vec<HermesMcpServer>,
+  skills_count: u32,
+  enabled_skills_count: u32,
+}
+
+#[tauri::command]
+fn hermes_read_runtime(
+  hermes_config_dir: String,
+  hermes_skills_dir: String,
+) -> Result<HermesRuntimeState, String> {
+  let config_path = PathBuf::from(&hermes_config_dir).join("config.yaml");
+  let mut mcp_servers: Vec<HermesMcpServer> = Vec::new();
+
+  if config_path.exists() {
+    let content = fs::read_to_string(&config_path)
+      .map_err(|err| format!("Failed to read Hermes config: {err}"))?;
+    let doc: toml::Value = toml::from_str(&content)
+      .map_err(|err| format!("Failed to parse Hermes config.yaml: {err}"))?;
+
+    if let Some(table) = doc.get("mcp_servers").and_then(|v| v.as_table()) {
+      for (name, value) in table {
+        let command = value
+          .get("command")
+          .and_then(|v| v.as_str())
+          .unwrap_or("")
+          .to_string();
+        let args = value
+          .get("args")
+          .and_then(|v| v.as_array())
+          .map(|arr| {
+            arr
+              .iter()
+              .filter_map(|v| v.as_str().map(String::from))
+              .collect()
+          })
+          .unwrap_or_default();
+        mcp_servers.push(HermesMcpServer {
+          name: name.clone(),
+          command,
+          args,
+        });
+      }
+    }
+  }
+
+  // Count skills
+  let skills_root = PathBuf::from(&hermes_skills_dir);
+  let mut skills_count: u32 = 0;
+  let mut enabled_skills_count: u32 = 0;
+
+  if skills_root.exists() {
+    if let Ok(categories) = fs::read_dir(&skills_root) {
+      for cat_entry in categories.flatten() {
+        let cat_path = cat_entry.path();
+        if cat_path.is_dir() {
+          if let Ok(skills) = fs::read_dir(&cat_path) {
+            for skill_entry in skills.flatten() {
+              let skill_path = skill_entry.path();
+              if skill_path.is_dir() && skill_path.join("SKILL.md").exists() {
+                skills_count += 1;
+                enabled_skills_count += 1;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  Ok(HermesRuntimeState {
+    mcp_servers,
+    skills_count,
+    enabled_skills_count,
+  })
+}
+
 #[tauri::command]
 fn claude_read_runtime(claude_config_dir: String) -> Result<ClaudeRuntimeState, String> {
   let installed_plugins_path = resolve_claude_installed_plugins_path(&claude_config_dir);
@@ -1178,6 +1473,111 @@ fn ccswitch_inject_status_line(
   })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectPluginStateResult {
+  updated_count: u32,
+  updated_provider_ids: Vec<String>,
+  backup_path: String,
+  enabled_plugins_count: usize,
+  plugin_configs_count: usize,
+}
+
+#[tauri::command]
+fn ccswitch_inject_plugin_state(
+  ccswitch_config_dir: String,
+  claude_config_dir: String,
+) -> Result<InjectPluginStateResult, String> {
+  if is_cc_switch_process_running() {
+    return Err(
+      "cc-switch is running. Please exit it from the tray (right-click → Quit) before injecting."
+        .to_string(),
+    );
+  }
+
+  // Read current plugin state from Claude settings.json
+  let settings_json = read_claude_settings_json(&claude_config_dir)?;
+  let enabled_plugins = settings_json
+    .get("enabledPlugins")
+    .cloned()
+    .unwrap_or(Value::Object(Map::new()));
+  let plugin_configs = settings_json
+    .get("pluginConfigs")
+    .cloned()
+    .unwrap_or(Value::Object(Map::new()));
+
+  let enabled_plugins_count = enabled_plugins
+    .as_object()
+    .map(|o| o.len())
+    .unwrap_or(0);
+  let plugin_configs_count = plugin_configs
+    .as_object()
+    .map(|o| o.len())
+    .unwrap_or(0);
+
+  let db_path = resolve_ccswitch_database_path(&ccswitch_config_dir);
+  if !db_path.exists() {
+    return Err(format!(
+      "cc-switch database not found: {}",
+      db_path.display()
+    ));
+  }
+
+  let backup_path = backup_ccswitch_database(&ccswitch_config_dir)?;
+  let mut conn = open_ccswitch_write_connection(&db_path)?;
+
+  let tx = conn
+    .transaction()
+    .map_err(|err| format!("Failed to start transaction: {err}"))?;
+
+  let mut stmt = tx
+    .prepare("SELECT id, settings_config FROM providers WHERE app_type = 'claude'")
+    .map_err(|err| format!("Failed to prepare select: {err}"))?;
+  let mapped_rows = stmt
+    .query_map([], |row| {
+      Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .map_err(|err| format!("Failed to query providers: {err}"))?;
+  let rows: Vec<(String, String)> = mapped_rows
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|err| format!("Failed to collect provider rows: {err}"))?;
+  drop(stmt);
+
+  let mut updated_ids: Vec<String> = Vec::with_capacity(rows.len());
+  for (id, settings_config) in rows {
+    let mut cfg: Value = serde_json::from_str(&settings_config)
+      .map_err(|err| format!("Provider {id} has invalid settings_config JSON: {err}"))?;
+
+    let obj = cfg.as_object_mut().ok_or_else(|| {
+      format!("Provider {id} settings_config root must be a JSON object")
+    })?;
+    obj.insert("enabledPlugins".to_string(), enabled_plugins.clone());
+    obj.insert("pluginConfigs".to_string(), plugin_configs.clone());
+
+    let new_config = serde_json::to_string(&cfg)
+      .map_err(|err| format!("Failed to serialize updated config for {id}: {err}"))?;
+
+    tx.execute(
+      "UPDATE providers SET settings_config = ?1 WHERE id = ?2 AND app_type = 'claude'",
+      rusqlite::params![new_config, id],
+    )
+    .map_err(|err| format!("Failed to update provider {id}: {err}"))?;
+
+    updated_ids.push(id);
+  }
+
+  tx.commit()
+    .map_err(|err| format!("Failed to commit transaction: {err}"))?;
+
+  Ok(InjectPluginStateResult {
+    updated_count: updated_ids.len() as u32,
+    updated_provider_ids: updated_ids,
+    backup_path: backup_path.display().to_string(),
+    enabled_plugins_count,
+    plugin_configs_count,
+  })
+}
+
 #[tauri::command]
 fn ccswitch_set_enabled(
   ccswitch_config_dir: String,
@@ -1268,6 +1668,7 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       codex_list_superpowers,
       codex_set_superpowers_enabled,
+      codex_read_installed_plugins,
       claude_read_runtime,
       claude_set_enabled_plugin,
       claude_set_plugin_config,
@@ -1283,6 +1684,8 @@ pub fn run() {
       ccswitch_process_running,
       ccswitch_backup_database,
       ccswitch_inject_status_line,
+      ccswitch_inject_plugin_state,
+      hermes_read_runtime,
       ccswitch_set_enabled,
       ccswitch_set_ai_orchestrator_config,
       path_exists

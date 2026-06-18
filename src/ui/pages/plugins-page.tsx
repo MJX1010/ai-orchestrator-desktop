@@ -4,6 +4,7 @@ import type {
   CcSwitchLifecycleState,
   DesiredPluginState,
   ObservedPluginState,
+  PluginCategory,
   PluginManifest,
   Provider,
 } from '../../shared/types'
@@ -32,8 +33,11 @@ interface PluginRow {
   observed?: ObservedPluginState
 }
 
-const allProviders = ['all', 'codex', 'claude', 'cc-switch'] as const
+const allProviders = ['all', 'codex', 'claude', 'cc-switch', 'hermes'] as const
 type ProviderFilter = (typeof allProviders)[number]
+
+const allCategories = ['all', 'plugin', 'mcp', 'bundled'] as const
+type CategoryFilter = (typeof allCategories)[number]
 
 const pluginKey = (provider: Provider, pluginId: string) => `${provider}:${pluginId}`
 
@@ -50,6 +54,24 @@ const lifecycleBadgeClass: Record<CcSwitchLifecycleState['status'], string> = {
   'missing-settings': 'badge badge-error',
 }
 
+const categoryBadgeClass: Record<PluginCategory, string> = {
+  mcp: 'badge badge-mcp',
+  plugin: 'badge badge-plugin',
+  bundled: 'badge badge-bundled',
+}
+
+const categoryLabel: Record<PluginCategory, string> = {
+  mcp: 'MCP',
+  plugin: 'Plugin',
+  bundled: 'Bundled',
+}
+
+const formatStars = (stars?: number): string => {
+  if (!stars) return ''
+  if (stars >= 1000) return `${(stars / 1000).toFixed(1)}k`
+  return String(stars)
+}
+
 export const PluginsPage = ({
   manifests,
   desiredPlugins,
@@ -60,14 +82,19 @@ export const PluginsPage = ({
   onSaveConfig,
   onRunCcSwitchLifecycleAction,
 }: PluginsPageProps) => {
-  const [filter, setFilter] = useState<ProviderFilter>('all')
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>('all')
+  const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('all')
   const [selectedKey, setSelectedKey] = useState<string>('')
   const [configDraftByKey, setConfigDraftByKey] = useState<Record<string, string>>({})
   const [configError, setConfigError] = useState<string | null>(null)
 
   const rows = useMemo<PluginRow[]>(() => {
     return manifests
-      .filter((manifest) => filter === 'all' || manifest.provider === filter)
+      .filter(
+        (manifest) =>
+          (providerFilter === 'all' || manifest.provider === providerFilter) &&
+          (categoryFilter === 'all' || manifest.category === categoryFilter),
+      )
       .map((manifest) => ({
         manifest,
         desired: desiredPlugins.find(
@@ -79,7 +106,7 @@ export const PluginsPage = ({
             plugin.provider === manifest.provider && plugin.pluginId === manifest.pluginId,
         ),
       }))
-  }, [desiredPlugins, filter, manifests, observedPlugins])
+  }, [categoryFilter, desiredPlugins, manifests, observedPlugins, providerFilter])
 
   const selectedPluginKey = useMemo(() => {
     if (!rows.length) {
@@ -137,22 +164,47 @@ export const PluginsPage = ({
     <div className="plugins-layout">
       <section className="panel">
         <h2>Plugins</h2>
-        <div className="provider-filter">
-          {allProviders.map((provider) => (
-            <button
-              key={provider}
-              className={provider === filter ? 'chip chip-active' : 'chip'}
-              onClick={() => setFilter(provider)}
-              type="button"
-            >
-              {provider.toUpperCase()}
-            </button>
-          ))}
+
+        {/* ── Filters ──────────────────────────────────────── */}
+        <div className="filter-bar">
+          <div className="filter-group">
+            <span className="filter-label">Provider</span>
+            <div className="provider-filter">
+              {allProviders.map((provider) => (
+                <button
+                  key={provider}
+                  className={provider === providerFilter ? 'chip chip-active' : 'chip'}
+                  onClick={() => setProviderFilter(provider)}
+                  type="button"
+                >
+                  {provider.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="filter-group">
+            <span className="filter-label">Type</span>
+            <div className="provider-filter">
+              {allCategories.map((cat) => (
+                <button
+                  key={cat}
+                  className={cat === categoryFilter ? 'chip chip-active' : 'chip'}
+                  onClick={() => setCategoryFilter(cat)}
+                  type="button"
+                >
+                  {cat === 'all' ? 'ALL' : cat.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
+
+        {/* ── Table ────────────────────────────────────────── */}
         <table className="plugin-table">
           <thead>
             <tr>
               <th>Plugin</th>
+              <th>Type</th>
               <th>Provider</th>
               <th>Version</th>
               <th>Health</th>
@@ -176,7 +228,19 @@ export const PluginsPage = ({
                     setConfigError(null)
                   }}
                 >
-                  <td>{row.manifest.displayName}</td>
+                  <td>
+                    <div className="plugin-name-cell">
+                      <strong>{row.manifest.displayName}</strong>
+                      {row.manifest.stars ? (
+                        <span className="stars-badge">★ {formatStars(row.manifest.stars)}</span>
+                      ) : null}
+                    </div>
+                  </td>
+                  <td>
+                    <span className={categoryBadgeClass[row.manifest.category]}>
+                      {categoryLabel[row.manifest.category]}
+                    </span>
+                  </td>
                   <td>{row.manifest.provider}</td>
                   <td>{installedVersion}</td>
                   <td>
@@ -200,7 +264,7 @@ export const PluginsPage = ({
             })}
             {!rows.length && (
               <tr>
-                <td colSpan={6} className="empty-state">
+                <td colSpan={7} className="empty-state">
                   No plugins found.
                 </td>
               </tr>
@@ -209,19 +273,65 @@ export const PluginsPage = ({
         </table>
       </section>
 
+      {/* ── Detail Panel ─────────────────────────────────── */}
       <section className="panel">
-        <h2>Plugin Config</h2>
+        <h2>Plugin Detail</h2>
         {selectedRow ? (
           <>
-            <div className="kv-grid">
-              <span>Plugin</span>
-              <strong>{selectedRow.manifest.displayName}</strong>
-              <span>Config Path</span>
-              <strong>{selectedRow.manifest.configPath}</strong>
-              <span>Schema</span>
-              <strong>{selectedRow.manifest.configSchemaRef}</strong>
+            {/* ── Metadata ───────────────────────────────── */}
+            <div className="plugin-detail-header">
+              <div className="plugin-detail-title">
+                <h3>{selectedRow.manifest.displayName}</h3>
+                <span className={categoryBadgeClass[selectedRow.manifest.category]}>
+                  {categoryLabel[selectedRow.manifest.category]}
+                </span>
+              </div>
+              {selectedRow.manifest.description && (
+                <p className="plugin-description">{selectedRow.manifest.description}</p>
+              )}
             </div>
 
+            <div className="kv-grid">
+              <span>Provider</span>
+              <strong>{selectedRow.manifest.provider}</strong>
+              <span>Source</span>
+              <strong>{selectedRow.manifest.source}</strong>
+              <span>Default Version</span>
+              <strong>{selectedRow.manifest.defaultVersion}</strong>
+              {selectedRow.manifest.stars ? (
+                <>
+                  <span>GitHub Stars</span>
+                  <strong>★ {selectedRow.manifest.stars.toLocaleString()}</strong>
+                </>
+              ) : null}
+              {selectedRow.manifest.repoUrl ? (
+                <>
+                  <span>Repository</span>
+                  <strong>
+                    <a
+                      href={selectedRow.manifest.repoUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="link"
+                    >
+                      {selectedRow.manifest.repoUrl.replace('https://github.com/', '')}
+                    </a>
+                  </strong>
+                </>
+              ) : null}
+              {selectedRow.manifest.installCommand ? (
+                <>
+                  <span>Install</span>
+                  <strong>
+                    <code className="install-cmd">{selectedRow.manifest.installCommand}</code>
+                  </strong>
+                </>
+              ) : null}
+              <span>Config Path</span>
+              <strong className="monospace">{selectedRow.manifest.configPath}</strong>
+            </div>
+
+            {/* ── cc-switch Lifecycle ─────────────────────── */}
             {selectedLifecycle && (
               <section className="lifecycle-panel">
                 <div className="panel-header">
@@ -291,9 +401,7 @@ export const PluginsPage = ({
                     onClick={() =>
                       onRunCcSwitchLifecycleAction(selectedLifecycle.pluginId, 'upgrade')
                     }
-                    disabled={
-                      isBusy || selectedLifecycle.status !== 'update-available'
-                    }
+                    disabled={isBusy || selectedLifecycle.status !== 'update-available'}
                   >
                     Upgrade
                   </button>
@@ -303,9 +411,7 @@ export const PluginsPage = ({
                       onRunCcSwitchLifecycleAction(selectedLifecycle.pluginId, 'enable')
                     }
                     disabled={
-                      isBusy ||
-                      !selectedLifecycle.installed ||
-                      selectedLifecycle.enabled
+                      isBusy || !selectedLifecycle.installed || selectedLifecycle.enabled
                     }
                   >
                     Enable
@@ -316,9 +422,7 @@ export const PluginsPage = ({
                       onRunCcSwitchLifecycleAction(selectedLifecycle.pluginId, 'disable')
                     }
                     disabled={
-                      isBusy ||
-                      !selectedLifecycle.installed ||
-                      !selectedLifecycle.enabled
+                      isBusy || !selectedLifecycle.installed || !selectedLifecycle.enabled
                     }
                   >
                     Disable
@@ -344,6 +448,8 @@ export const PluginsPage = ({
               </section>
             )}
 
+            {/* ── Config Editor ──────────────────────────── */}
+            <h3>Configuration</h3>
             <textarea
               value={configDraft}
               onChange={(event) => {
@@ -366,7 +472,7 @@ export const PluginsPage = ({
             </div>
           </>
         ) : (
-          <p className="empty-state">Select a plugin to edit configuration.</p>
+          <p className="empty-state">Select a plugin to view details.</p>
         )}
       </section>
     </div>

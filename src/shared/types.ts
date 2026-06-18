@@ -1,4 +1,4 @@
-export const providers = ['codex', 'claude', 'cc-switch'] as const
+export const providers = ['codex', 'claude', 'cc-switch', 'hermes'] as const
 
 export type Provider = (typeof providers)[number]
 
@@ -10,6 +10,8 @@ export type ReconcileAction = 'install' | 'upgrade' | 'enable' | 'disable' | 'no
 
 export type OperationResult = 'running' | 'success' | 'failed'
 
+export type PluginCategory = 'mcp' | 'plugin' | 'bundled'
+
 export interface PluginManifest {
   pluginId: string
   provider: Provider
@@ -19,6 +21,11 @@ export interface PluginManifest {
   defaultVersion: string
   configSchemaRef: string
   configPath: string
+  category: PluginCategory
+  description: string
+  repoUrl?: string
+  installCommand?: string
+  stars?: number
 }
 
 export interface DesiredPluginState {
@@ -72,6 +79,8 @@ export interface ProviderPathConfig {
   claudeConfigDir: string
   ccSwitchConfigDir: string
   ccSwitchDatabasePath: string
+  hermesConfigDir: string
+  hermesSkillsDir: string
   gitRepoUrl: string
   gitRepoDir: string
   gitBranch: string
@@ -213,6 +222,14 @@ export interface InjectStatusLineResult {
   statusLineCommand?: string
 }
 
+export interface InjectPluginStateResult {
+  updatedCount: number
+  updatedProviderIds: string[]
+  backupPath: string
+  enabledPluginsCount: number
+  pluginConfigsCount: number
+}
+
 export interface AppSnapshot {
   manifests: PluginManifest[]
   profiles: string[]
@@ -224,4 +241,96 @@ export interface AppSnapshot {
   gitReadOnlyStatus: GitReadOnlyStatus
   ccSwitchLifecycle: CcSwitchLifecycleState[]
   settings: AppSettings
+  mcpServers: McpServerEntry[]
+  skills: SkillEntry[]
+  configOwnership: ConfigOwnershipEntry[]
+}
+
+// ── MCP Unified Management (cc-switch pattern) ─────────────────
+
+export interface McpServerEntry {
+  id: string
+  name: string
+  command: string
+  args: string[]
+  description: string
+  repoUrl?: string
+  installCommand?: string
+  enabledClaude: boolean
+  enabledCodex: boolean
+  enabledHermes: boolean
+  source: 'local' | 'registry'
+  lastSyncAt?: string
+}
+
+export interface McpToggleRequest {
+  serverId: string
+  app: 'claude' | 'codex' | 'hermes'
+  enabled: boolean
+}
+
+// ── Skills SSOT (cc-switch pattern) ────────────────────────────
+
+export type SkillSyncMethod = 'symlink' | 'copy'
+
+export interface SkillEntry {
+  id: string
+  name: string
+  description: string
+  sourceRepo?: string
+  sourcePath: string
+  version: string
+  contentHash: string
+  installedAt: string
+  updatedAt: string
+  enabledClaude: boolean
+  enabledCodex: boolean
+  enabledHermes: boolean
+  syncMethod: SkillSyncMethod
+}
+
+export interface SkillRepo {
+  owner: string
+  name: string
+  branch: string
+  url: string
+  lastScannedAt?: string
+}
+
+export interface SkillInstallRequest {
+  repoOwner: string
+  repoName: string
+  skillPath: string
+  branch?: string
+}
+
+// ── Plugin Registry (Codex++ market pattern) ───────────────────
+
+export interface RegistryPlugin {
+  id: string
+  name: string
+  description: string
+  version: string
+  author: string
+  category: PluginCategory
+  tags: string[]
+  homepage: string
+  repoUrl: string
+  installCommand: string
+  sha256?: string
+  stars?: number
+  downloads?: number
+  compatibleApps: ('claude' | 'codex' | 'hermes')[]
+  installed: boolean
+  installedVersion?: string
+  updateAvailable: boolean
+}
+
+// ── Config Ownership (Codex++ coordinator pattern) ─────────────
+
+export interface ConfigOwnershipEntry {
+  configPath: string
+  lastWriter: string
+  lastWrittenAt: string
+  fingerprint: string
 }

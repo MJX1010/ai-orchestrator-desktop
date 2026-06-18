@@ -14,10 +14,13 @@ import type {
 import { buildReconcilePlan } from './planner'
 import {
   mockCcSwitchLifecycle,
+  mockConfigOwnership,
   mockDesiredState,
   mockManifests,
+  mockMcpServers,
   mockProfiles,
   mockSettings,
+  mockSkills,
   mockSyncStatus,
 } from '../shared/mock-data'
 import type {
@@ -57,12 +60,20 @@ interface ClaudeRuntimeState {
   plugin_configs: Record<string, unknown>
 }
 
-const staticNonClaudeManifests = mockManifests.filter((m) => m.provider !== 'claude')
+const staticNonClaudeNonCodexManifests = mockManifests.filter(
+  (m) => m.provider !== 'claude' && m.provider !== 'codex',
+)
 
 const staticClaudeManifestsByExternalId = new Map(
   mockManifests
     .filter((m) => m.provider === 'claude' && m.externalId)
     .map((m) => [m.externalId!, m]),
+)
+
+const staticCodexManifestsByPluginId = new Map(
+  mockManifests
+    .filter((m) => m.provider === 'codex')
+    .map((m) => [m.pluginId, m]),
 )
 
 function claudeKeyToManifest(key: string, version: string): PluginManifest {
@@ -81,13 +92,40 @@ function claudeKeyToManifest(key: string, version: string): PluginManifest {
     defaultVersion: version,
     configSchemaRef: `schemas/dynamic/${pluginId}.schema.json`,
     configPath: `${mockSettings.paths.claudeConfigDir}/plugins/${pluginId}`,
+    category: 'plugin',
+    description: `Claude plugin: ${displayName}`,
   }
+}
+
+function codexPluginToManifest(
+  pluginId: string,
+  displayName: string,
+  version: string,
+): PluginManifest {
+  return (
+    staticCodexManifestsByPluginId.get(pluginId) ?? {
+      pluginId,
+      provider: 'codex',
+      displayName,
+      externalId: pluginId,
+      source: 'local',
+      defaultVersion: version || 'unknown',
+      configSchemaRef: `schemas/dynamic/${pluginId}.schema.json`,
+      configPath: `${mockSettings.paths.codexScriptsDir}/${pluginId}`,
+      category: 'plugin' as const,
+      description: `Codex plugin: ${displayName}`,
+    }
+  )
 }
 
 async function buildRuntimeManifests(): Promise<PluginManifest[]> {
   if (!isTauriRuntime()) {
     return clone(mockManifests)
   }
+
+  const manifests: PluginManifest[] = [...staticNonClaudeNonCodexManifests]
+
+  // Discover Claude plugins from installed_plugins.json
   try {
     const runtime = await invoke<ClaudeRuntimeState>('claude_read_runtime', {
       claudeConfigDir: mockSettings.paths.claudeConfigDir,
@@ -95,10 +133,72 @@ async function buildRuntimeManifests(): Promise<PluginManifest[]> {
     const claudeManifests = runtime.installed_plugins.map((p) =>
       staticClaudeManifestsByExternalId.get(p.key) ?? claudeKeyToManifest(p.key, p.version),
     )
-    return [...staticNonClaudeManifests, ...claudeManifests]
-  } catch {
-    return clone(mockManifests)
+    manifests.push(...claudeManifests)
+  } catch (error) {
+    console.error('[orchestrator] Failed to read Claude runtime, using mock fallback:', error)
+    manifests.push(...mockManifests.filter((m) => m.provider === 'claude'))
   }
+
+  // Discover Codex plugins from config.toml + filesystem
+  try {
+    const codexPlugins = await invoke<
+      Array<{
+        pluginId: string
+        displayName: string
+        marketplace: string
+        version: string
+        enabled: boolean
+      }>
+    >('codex_read_installed_plugins')
+    for (const plugin of codexPlugins) {
+      manifests.push(
+        codexPluginToManifest(plugin.pluginId, plugin.displayName, plugin.version),
+      )
+    }
+  } catch (error) {
+    console.error('[orchestrator] Failed to read Codex plugins, using mock fallback:', error)
+    manifests.push(...mockManifests.filter((m) => m.provider === 'codex'))
+  }
+
+  // Discover Hermes MCP servers from config.yaml
+  try {
+    const hermesRuntime = await invoke<{
+      mcpServers: Array<{ name: string; command: string; args: string[] }>
+      skillsCount: number
+      enabledSkillsCount: number
+    }>('hermes_read_runtime', {
+      hermesConfigDir: mockSettings.paths.hermesConfigDir,
+      hermesSkillsDir: mockSettings.paths.hermesSkillsDir,
+    })
+    // Add any MCP servers not already in manifests
+    const existingHermes = new Set(
+      manifests.filter((m) => m.provider === 'hermes').map((m) => m.pluginId),
+    )
+    for (const server of hermesRuntime.mcpServers) {
+      if (!existingHermes.has(server.name)) {
+        const displayName = server.name
+          .split(/[-_]/)
+          .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+          .join(' ')
+        manifests.push({
+          pluginId: server.name,
+          provider: 'hermes',
+          displayName,
+          externalId: server.name,
+          source: 'registry',
+          defaultVersion: 'unknown',
+          configSchemaRef: `schemas/dynamic/${server.name}.schema.json`,
+          configPath: `${mockSettings.paths.hermesConfigDir}/config.yaml#mcp_servers.${server.name}`,
+          category: 'mcp' as const,
+          description: `Hermes MCP server: ${displayName}`,
+        })
+      }
+    }
+  } catch (error) {
+    console.error('[orchestrator] Failed to read Hermes runtime:', error)
+  }
+
+  return manifests
 }
 
 async function loadSavedDesiredState(): Promise<DesiredState | null> {
@@ -191,6 +291,9 @@ export class MockOrchestrator {
       gitReadOnlyStatus: this.gitReadOnlyStatus,
       ccSwitchLifecycle: this.getCcSwitchAdapter().getLifecycleStates(),
       settings: this.settings,
+      mcpServers: mockMcpServers,
+      skills: mockSkills,
+      configOwnership: mockConfigOwnership,
     })
   }
 
@@ -326,7 +429,7 @@ export class MockOrchestrator {
     const operationLog = this.beginOperation(dryRun ? 'Dry-run reconcile' : 'Apply reconcile')
 
     try {
-      const plan = buildReconcilePlan(this.desiredState, this.observedState, mockManifests)
+      const plan = buildReconcilePlan(this.desiredState, this.observedState, this.manifests)
       this.lastPlan = plan
       operationLog.details.push(`Generated ${plan.length} plan item(s)`)
 

@@ -1,6 +1,7 @@
 import { isTauriRuntime } from './tauri.ts'
 import type {
   CcSwitchProvidersSnapshot,
+  InjectPluginStateResult,
   InjectStatusLineResult,
 } from './types.ts'
 
@@ -83,5 +84,19 @@ export const injectStatusLineToAllProviders = async (
     ccswitchConfigDir,
     appType,
     statusLine,
+  })
+}
+
+export const injectPluginStateToAllProviders = async (
+  ccswitchConfigDir: string,
+  claudeConfigDir: string,
+): Promise<InjectPluginStateResult> => {
+  if (!isTauriRuntime()) {
+    throw new Error('Tauri runtime not available (web preview)')
+  }
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<InjectPluginStateResult>('ccswitch_inject_plugin_state', {
+    ccswitchConfigDir,
+    claudeConfigDir,
   })
 }

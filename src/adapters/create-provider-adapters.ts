@@ -1,6 +1,7 @@
 import { ClaudeProviderAdapter } from './claude-provider-adapter'
 import { CcSwitchProviderAdapter } from './ccswitch-provider-adapter'
 import { CodexProviderAdapter } from './codex-provider-adapter'
+import { HermesProviderAdapter } from './hermes-provider-adapter'
 import type { ProviderAdapter } from './provider-adapter'
 import type {
   AppSettings,
@@ -34,5 +35,12 @@ export const createProviderAdapters = (
     ccSwitchLifecycle,
   )
 
-  return [codexAdapter, claudeAdapter, ccSwitchAdapter]
+  const hermesAdapter = new HermesProviderAdapter(
+    manifests.filter((manifest) => manifest.provider === 'hermes'),
+    desiredPlugins.filter((plugin) => plugin.provider === 'hermes'),
+    settings.paths.hermesConfigDir,
+    settings.paths.hermesSkillsDir,
+  )
+
+  return [codexAdapter, claudeAdapter, ccSwitchAdapter, hermesAdapter]
 }

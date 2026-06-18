@@ -2,16 +2,27 @@ import { useMemo, useState } from 'react'
 import './App.css'
 import { useOrchestrator } from './ui/hooks/use-orchestrator'
 import { DashboardPage } from './ui/pages/dashboard-page'
+import { McpPage } from './ui/pages/mcp-page'
 import { PluginsPage } from './ui/pages/plugins-page'
 import { ProfilesPage } from './ui/pages/profiles-page'
 import { SettingsPage } from './ui/pages/settings-page'
+import { SkillsPage } from './ui/pages/skills-page'
 import { SyncPage } from './ui/pages/sync-page'
 
-type AppPage = 'dashboard' | 'plugins' | 'profiles' | 'sync' | 'settings'
+type AppPage =
+  | 'dashboard'
+  | 'plugins'
+  | 'mcp'
+  | 'skills'
+  | 'profiles'
+  | 'sync'
+  | 'settings'
 
 const navigation: Array<{ key: AppPage; label: string }> = [
   { key: 'dashboard', label: 'Dashboard' },
   { key: 'plugins', label: 'Plugins' },
+  { key: 'mcp', label: 'MCP' },
+  { key: 'skills', label: 'Skills' },
   { key: 'profiles', label: 'Profiles' },
   { key: 'sync', label: 'Sync' },
   { key: 'settings', label: 'Settings' },
@@ -76,7 +87,7 @@ function App() {
         <header className="topbar">
           <div>
             <strong>AI Plugin Orchestrator</strong>
-            <p>Windows V1 · Codex / Claude / cc-switch</p>
+            <p>Windows V1 · Codex / Claude / Hermes / cc-switch</p>
           </div>
           <div className="actions">
             <button type="button" onClick={refresh} disabled={isBusy}>
@@ -111,6 +122,21 @@ function App() {
           />
         )}
 
+        {activePage === 'mcp' && (
+          <McpPage
+            servers={snapshot.mcpServers}
+            isBusy={isBusy}
+            onToggle={async (request) => {
+              // TODO: wire to Rust backend mcp_toggle command
+              console.log('[MCP toggle]', request)
+            }}
+          />
+        )}
+
+        {activePage === 'skills' && (
+          <SkillsPage skills={snapshot.skills} isBusy={isBusy} />
+        )}
+
         {activePage === 'profiles' && (
           <ProfilesPage
             currentProfile={snapshot.desiredState.profileName}
@@ -119,6 +145,7 @@ function App() {
             lastReconciledAt={snapshot.observedState.lastReconciledAt}
             isBusy={isBusy}
             ccSwitchConfigDir={snapshot.settings.paths.ccSwitchConfigDir}
+            claudeConfigDir={snapshot.settings.paths.claudeConfigDir}
             onDryRun={reconcileDryRun}
             onApply={reconcileApply}
           />

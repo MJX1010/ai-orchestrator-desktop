@@ -59,19 +59,19 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   public async discover(): Promise<ObservedPluginState[]> {
     const states: ObservedPluginState[] = []
-    for (const pluginId of this.manifestByPluginId.keys()) {
+    for (const [pluginId, manifest] of this.manifestByPluginId) {
       if (pluginId === 'superpowers') {
         states.push(await this.discoverSuperpowers())
         continue
       }
+      // If a plugin has a manifest, it was discovered from config.toml or cache — treat as installed
       states.push({
         provider: 'codex',
         pluginId,
-        installed: false,
-        installedVersion: null,
-        enabled: false,
-        health: 'warn',
-        lastError: 'No discover strategy defined for this plugin',
+        installed: true,
+        installedVersion: manifest.defaultVersion !== 'unknown' ? manifest.defaultVersion : null,
+        enabled: true,
+        health: 'ok',
       })
     }
     return states

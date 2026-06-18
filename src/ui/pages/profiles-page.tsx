@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
 import type {
   CcSwitchProvidersSnapshot,
+  InjectPluginStateResult,
   InjectStatusLineResult,
   ReconcilePlanItem,
 } from '../../shared/types'
 import {
   DEFAULT_STATUS_LINE,
+  injectPluginStateToAllProviders,
   injectStatusLineToAllProviders,
   isCcSwitchProcessRunning,
   loadCcSwitchProvidersSnapshot,
@@ -18,6 +20,7 @@ interface ProfilesPageProps {
   lastReconciledAt?: string
   isBusy: boolean
   ccSwitchConfigDir: string
+  claudeConfigDir: string
   onDryRun: () => Promise<void>
   onApply: () => Promise<void>
 }
@@ -39,6 +42,7 @@ export const ProfilesPage = ({
   lastReconciledAt,
   isBusy,
   ccSwitchConfigDir,
+  claudeConfigDir,
   onDryRun,
   onApply,
 }: ProfilesPageProps) => {
@@ -49,6 +53,10 @@ export const ProfilesPage = ({
   const [injecting, setInjecting] = useState(false)
   const [injectError, setInjectError] = useState<string | null>(null)
   const [lastInject, setLastInject] = useState<InjectStatusLineResult | null>(null)
+  const [injectingPluginState, setInjectingPluginState] = useState(false)
+  const [pluginStateError, setPluginStateError] = useState<string | null>(null)
+  const [lastPluginStateInject, setLastPluginStateInject] =
+    useState<InjectPluginStateResult | null>(null)
 
   const fetchProviders = async () => {
     const result = await loadCcSwitchProvidersSnapshot(ccSwitchConfigDir, 'claude')
@@ -123,8 +131,45 @@ export const ProfilesPage = ({
     }
   }
 
+  const handleInjectPluginState = async () => {
+    setPluginStateError(null)
+    setLastPluginStateInject(null)
+
+    try {
+      setCheckingProcess(true)
+      const running = await isCcSwitchProcessRunning()
+      if (running) {
+        setPluginStateError(
+          'cc-switch is currently running. Please exit it from the system tray (right-click → Quit) and try again.',
+        )
+        return
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      setPluginStateError(message)
+      return
+    } finally {
+      setCheckingProcess(false)
+    }
+
+    setInjectingPluginState(true)
+    try {
+      const result = await injectPluginStateToAllProviders(
+        ccSwitchConfigDir,
+        claudeConfigDir,
+      )
+      setLastPluginStateInject(result)
+      await fetchProviders()
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      setPluginStateError(message)
+    } finally {
+      setInjectingPluginState(false)
+    }
+  }
+
   const providers = providersSnapshot?.providers ?? []
-  const fixBusy = checkingProcess || injecting
+  const fixBusy = checkingProcess || injecting || injectingPluginState
   const missingStatusLineCount = providers.filter(
     (provider) => !provider.hasStatusLine,
   ).length
@@ -248,6 +293,43 @@ export const ProfilesPage = ({
               DB: <code>{providersSnapshot.dbPath}</code>
             </p>
           </>
+        )}
+      </section>
+
+      <section className="panel">
+        <header className="panel-header">
+          <div>
+            <h2>Plugin State Sync</h2>
+            <p>
+              Inject current <code>enabledPlugins</code> and <code>pluginConfigs</code> from{' '}
+              <code>~/.claude/settings.json</code> into all cc-switch providers. This prevents
+              plugin config loss when switching providers.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleInjectPluginState}
+            disabled={fixBusy}
+          >
+            {checkingProcess
+              ? 'Checking cc-switch…'
+              : injectingPluginState
+                ? 'Injecting…'
+                : 'Inject Plugin State'}
+          </button>
+        </header>
+
+        {pluginStateError && (
+          <p className="error-banner">{pluginStateError}</p>
+        )}
+
+        {lastPluginStateInject && (
+          <p className="muted">
+            Injected {lastPluginStateInject.enabledPluginsCount} enabled plugin(s) and{' '}
+            {lastPluginStateInject.pluginConfigsCount} config(s) into{' '}
+            {lastPluginStateInject.updatedCount} provider(s).
+            Backup saved to <code>{lastPluginStateInject.backupPath}</code>.
+          </p>
         )}
       </section>
 
